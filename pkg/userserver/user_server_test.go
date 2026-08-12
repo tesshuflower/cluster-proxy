@@ -1,0 +1,305 @@
+package userserver
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	konnectivity "sigs.k8s.io/apiserver-network-proxy/konnectivity-client/pkg/client"
+)
+
+// fakeConn is a minimal net.Conn that satisfies the interface for tests.
+type fakeConn struct{}
+
+func (f *fakeConn) Read(b []byte) (int, error)          { return 0, io.EOF }
+func (f *fakeConn) Write(b []byte) (int, error)         { return len(b), nil }
+func (f *fakeConn) Close() error                         { return nil }
+func (f *fakeConn) LocalAddr() net.Addr                  { return &net.TCPAddr{} }
+func (f *fakeConn) RemoteAddr() net.Addr                 { return &net.TCPAddr{} }
+func (f *fakeConn) SetDeadline(t time.Time) error        { return nil }
+func (f *fakeConn) SetReadDeadline(t time.Time) error    { return nil }
+func (f *fakeConn) SetWriteDeadline(t time.Time) error   { return nil }
+
+var _ net.Conn = (*fakeConn)(nil)
+
+// fakeTunnel implements konnectivity.Tunnel and counts DialContext calls.
+type fakeTunnel struct {
+	dialCount int64
+	done      chan struct{}
+}
+
+func newFakeTunnel() *fakeTunnel {
+	t := &fakeTunnel{done: make(chan struct{})}
+	close(t.done)
+	return t
+}
+
+func (f *fakeTunnel) DialContext(_ context.Context, _, _ string) (net.Conn, error) {
+	atomic.AddInt64(&f.dialCount, 1)
+	return &fakeConn{}, nil
+}
+
+func (f *fakeTunnel) Done() <-chan struct{} { return f.done }
+
+var _ konnectivity.Tunnel = (*fakeTunnel)(nil)
+
+// dialingFakeTunnel dials a real TCP address, for tests that need ServeHTTP to
+// complete an actual HTTP round-trip.
+type dialingFakeTunnel struct {
+	addr string
+	done chan struct{}
+}
+
+func newDialingFakeTunnel(addr string) *dialingFakeTunnel {
+	t := &dialingFakeTunnel{addr: addr, done: make(chan struct{})}
+	close(t.done)
+	return t
+}
+
+func (d *dialingFakeTunnel) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, d.addr)
+}
+
+func (d *dialingFakeTunnel) Done() <-chan struct{} { return d.done }
+
+var _ konnectivity.Tunnel = (*dialingFakeTunnel)(nil)
+
+// setupServiceProxyRootCA overrides the package-level serviceProxyRootCA for
+// the duration of a test and restores it on cleanup.
+func setupServiceProxyRootCA(t *testing.T, pool *x509.CertPool) {
+	t.Helper()
+	old := serviceProxyRootCA
+	serviceProxyRootCA = pool
+	t.Cleanup(func() { serviceProxyRootCA = old })
+}
+
+// --- getOrCreateTransport tests ---
+
+func TestGetOrCreateTransport_ReturnsSameTransportForSameCluster(t *testing.T) {
+	s := &userServer{}
+	s.getTunnel = func(_ context.Context) (konnectivity.Tunnel, error) {
+		return newFakeTunnel(), nil
+	}
+
+	t1 := s.getOrCreateTransport("cluster1")
+	t2 := s.getOrCreateTransport("cluster1")
+
+	if t1 != t2 {
+		t.Fatal("expected same *http.Transport for same cluster, got different pointers")
+	}
+}
+
+func TestGetOrCreateTransport_ReturnsDifferentTransportForDifferentClusters(t *testing.T) {
+	s := &userServer{}
+	s.getTunnel = func(_ context.Context) (konnectivity.Tunnel, error) {
+		return newFakeTunnel(), nil
+	}
+
+	ta := s.getOrCreateTransport("cluster-a")
+	tb := s.getOrCreateTransport("cluster-b")
+
+	if ta == tb {
+		t.Fatal("expected different *http.Transport for different clusters, got same pointer")
+	}
+}
+
+func TestGetOrCreateTransport_Settings(t *testing.T) {
+	s := &userServer{}
+	s.getTunnel = func(_ context.Context) (konnectivity.Tunnel, error) {
+		return newFakeTunnel(), nil
+	}
+
+	transport := s.getOrCreateTransport("cluster1")
+
+	if transport.MaxIdleConns != 100 {
+		t.Errorf("MaxIdleConns: got %d, want 100", transport.MaxIdleConns)
+	}
+	if transport.MaxIdleConnsPerHost != 10 {
+		t.Errorf("MaxIdleConnsPerHost: got %d, want 10", transport.MaxIdleConnsPerHost)
+	}
+	if transport.IdleConnTimeout != 90*time.Second {
+		t.Errorf("IdleConnTimeout: got %v, want 90s", transport.IdleConnTimeout)
+	}
+	if transport.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 must be false to allow SPDY upgrades")
+	}
+	if transport.TLSClientConfig == nil {
+		t.Fatal("TLSClientConfig must not be nil")
+	}
+	if transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Errorf("TLS MinVersion: got %d, want %d (TLS 1.2)",
+			transport.TLSClientConfig.MinVersion, tls.VersionTLS12)
+	}
+}
+
+func TestGetOrCreateTransport_ConcurrentAccessReturnsSameTransport(t *testing.T) {
+	s := &userServer{}
+	s.getTunnel = func(_ context.Context) (konnectivity.Tunnel, error) {
+		return newFakeTunnel(), nil
+	}
+
+	const goroutines = 50
+	results := make([]*http.Transport, goroutines)
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			results[i] = s.getOrCreateTransport("cluster1")
+		}()
+	}
+	wg.Wait()
+
+	first := results[0]
+	for i, tr := range results {
+		if tr != first {
+			t.Errorf("goroutine %d got a different transport pointer", i)
+		}
+	}
+}
+
+func TestGetOrCreateTransport_DialContextCreatesNewTunnelOnPoolMiss(t *testing.T) {
+	var tunnelCount int64
+	s := &userServer{}
+	s.getTunnel = func(_ context.Context) (konnectivity.Tunnel, error) {
+		atomic.AddInt64(&tunnelCount, 1)
+		return newFakeTunnel(), nil
+	}
+
+	transport := s.getOrCreateTransport("cluster1")
+
+	// First pool miss: expect one tunnel.
+	conn, err := transport.DialContext(context.Background(), "tcp", "cluster1.proxy:7443")
+	if err != nil {
+		t.Fatalf("first DialContext: %v", err)
+	}
+	conn.Close()
+
+	if got := atomic.LoadInt64(&tunnelCount); got != 1 {
+		t.Errorf("after first pool miss: got %d tunnels, want 1", got)
+	}
+
+	// Second pool miss: expect a second tunnel (each tunnel is single-use).
+	conn2, err := transport.DialContext(context.Background(), "tcp", "cluster1.proxy:7443")
+	if err != nil {
+		t.Fatalf("second DialContext: %v", err)
+	}
+	conn2.Close()
+
+	if got := atomic.LoadInt64(&tunnelCount); got != 2 {
+		t.Errorf("after second pool miss: got %d tunnels, want 2", got)
+	}
+}
+
+func TestGetOrCreateTransport_TunnelNotCreatedOnCacheLookup(t *testing.T) {
+	// Verifies that merely looking up the cached transport does not call
+	// getTunnel -- tunnels are created lazily on DialContext (pool miss).
+	var tunnelCount int64
+	s := &userServer{}
+	s.getTunnel = func(_ context.Context) (konnectivity.Tunnel, error) {
+		atomic.AddInt64(&tunnelCount, 1)
+		return newFakeTunnel(), nil
+	}
+
+	// Two cache lookups -- no DialContext calls yet.
+	_ = s.getOrCreateTransport("cluster1")
+	_ = s.getOrCreateTransport("cluster1")
+
+	if got := atomic.LoadInt64(&tunnelCount); got != 0 {
+		t.Errorf("getTunnel must not be called during cache lookup, got %d calls", got)
+	}
+}
+
+// --- ServeHTTP upgrade-detection tests ---
+
+func TestServeHTTP_NonUpgradeUsesTransportCache(t *testing.T) {
+	// Verifies that non-upgrade requests use the cached transport (getTunnel is
+	// not called just from cache lookup -- only on a DialContext pool miss).
+	var tunnelCount int64
+	s := &userServer{}
+	s.getTunnel = func(_ context.Context) (konnectivity.Tunnel, error) {
+		atomic.AddInt64(&tunnelCount, 1)
+		return newFakeTunnel(), nil
+	}
+
+	// Seeding the cache must not trigger getTunnel.
+	preexisting := s.getOrCreateTransport("mycluster")
+	if atomic.LoadInt64(&tunnelCount) != 0 {
+		t.Fatal("getTunnel must not be called on cache seed")
+	}
+
+	// A second lookup must return the same transport.
+	if s.getOrCreateTransport("mycluster") != preexisting {
+		t.Error("second cache lookup returned a different transport")
+	}
+}
+
+func TestServeHTTP_UpgradeRequestBypassesTransportCache(t *testing.T) {
+	// Start a TLS backend that just returns 200.
+	backend := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(backend.Close)
+
+	rootCAs := backend.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
+	setupServiceProxyRootCA(t, rootCAs)
+
+	var tunnelCount int64
+	s := &userServer{}
+	s.getTunnel = func(ctx context.Context) (konnectivity.Tunnel, error) {
+		atomic.AddInt64(&tunnelCount, 1)
+		return newDialingFakeTunnel(backend.Listener.Addr().String()), nil
+	}
+
+	// Seed the cache for this cluster.
+	preexisting := s.getOrCreateTransport("mycluster")
+
+	// Send an upgrade request.
+	req := httptest.NewRequest(http.MethodGet,
+		"/mycluster/api/v1/namespaces/default/pods/pod/exec", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "SPDY/3.1")
+	rr := httptest.NewRecorder()
+
+	s.ServeHTTP(rr, req)
+
+	// getTunnel must have been called for the upgrade request (bypass path).
+	if got := atomic.LoadInt64(&tunnelCount); got == 0 {
+		t.Error("getTunnel must be called for upgrade requests")
+	}
+
+	// The cached transport must be unchanged.
+	if s.getOrCreateTransport("mycluster") != preexisting {
+		t.Error("upgrade request must not replace the cached transport")
+	}
+}
+
+func TestServeHTTP_DifferentClustersGetDifferentTransports(t *testing.T) {
+	s := &userServer{}
+	s.getTunnel = func(_ context.Context) (konnectivity.Tunnel, error) {
+		return newFakeTunnel(), nil
+	}
+
+	ta := s.getOrCreateTransport("cluster-a")
+	tb := s.getOrCreateTransport("cluster-b")
+
+	if ta == tb {
+		t.Error("different clusters must have different cached transports")
+	}
+	if s.getOrCreateTransport("cluster-a") != ta {
+		t.Error("second lookup for cluster-a must return the same transport")
+	}
+	if s.getOrCreateTransport("cluster-b") != tb {
+		t.Error("second lookup for cluster-b must return the same transport")
+	}
+}

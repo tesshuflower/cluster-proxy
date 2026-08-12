@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/grpc/keepalive"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/klog/v2"
+	"k8s.io/streaming/pkg/httpstream"
 
 	addonutils "open-cluster-management.io/addon-framework/pkg/utils"
 	addonclient "open-cluster-management.io/api/client/addon/clientset/versioned"
@@ -56,7 +58,6 @@ var (
 )
 
 type userServer struct {
-	// TODO: make it a controller and reuse tunnel for each cluster to improve performance.
 	getTunnel       func(context.Context) (konnectivity.Tunnel, error)
 	proxyServerHost string
 	proxyServerPort int
@@ -70,6 +71,13 @@ type userServer struct {
 	agentInstallNamespace  string
 
 	addonLister addonlisterv1beta1.ManagedClusterAddOnLister
+
+	// transports caches one http.Transport per managed cluster name.
+	// Each transport maintains a connection pool to the cluster's service-proxy,
+	// allowing tunnel reuse across sequential HTTP requests and eliminating the
+	// tunnel-per-request churn that saturates the ANP proxy-server under load.
+	// Key: cluster name (string), Value: *http.Transport
+	transports sync.Map
 }
 
 func (k *userServer) AddFlags(cmd *cobra.Command) {
@@ -159,6 +167,66 @@ func (k *userServer) init(ctx context.Context) error {
 	return nil
 }
 
+// getOrCreateTransport returns a cached *http.Transport for the given cluster,
+// creating one if it does not already exist.
+//
+// The key mechanism is Go's http.Transport connection pooling. After a request
+// completes, the transport retains the underlying net.Conn in its idle pool
+// rather than closing it. Because the net.Conn IS the konnectivity tunnel (the
+// connection established by DialContext through the ANP proxy-server), keeping
+// the connection alive keeps the tunnel -- and the Proxy() gRPC stream on the
+// proxy-server -- alive between requests. Subsequent requests to the same
+// cluster reuse the idle connection without invoking DialContext at all: no new
+// tunnel, no new gRPC stream, no additional Proxy() handler on the proxy-server.
+//
+// DialContext is therefore only called on a pool miss: the first request to a
+// cluster, after IdleConnTimeout (90s) elapses with no activity, or when
+// concurrent requests exhaust the pool (up to MaxIdleConnsPerHost connections
+// are retained). At high request rates, multiple connections may exist
+// simultaneously, but each is reused by subsequent requests rather than torn
+// down after a single use.
+//
+// Without this caching, every HTTP request creates a new gRPC tunnel (full
+// TCP+TLS+HTTP/2 negotiation) regardless of whether an existing tunnel is idle.
+// Under load this saturates the ANP proxy-server with concurrent short-lived
+// Proxy() handlers, causing lock contention on shared state and channel
+// backpressure errors.
+func (k *userServer) getOrCreateTransport(clusterName string) *http.Transport {
+	if t, ok := k.transports.Load(clusterName); ok {
+		return t.(*http.Transport)
+	}
+
+	transport := &http.Transport{
+		MaxIdleConns:        100, // really MaxIdleConnsPerHost is the limit since this transport is for 1 host (managed cluster) only.
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		TLSHandshakeTimeout: 10 * time.Second,
+		// Not using our global TLSConfig for outbound will rely on server settings
+		TLSClientConfig: &tls.Config{
+			RootCAs:    serviceProxyRootCA,
+			MinVersion: tls.VersionTLS12,
+		},
+		// golang http pkg automatically upgrade http connection to http2 connection, but http2 can not upgrade to SPDY which used in "kubectl exec".
+		// set ForceAttemptHTTP2 = false to prevent auto http2 upgration
+		ForceAttemptHTTP2:     false,
+		ExpectContinueTimeout: 1 * time.Second,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			klog.V(4).Infof("creating tunnel for cluster %s (transport pool miss)", clusterName)
+			tunnel, err := k.getTunnel(ctx)
+			if err != nil {
+				return nil, err
+			}
+			return tunnel.DialContext(ctx, network, addr)
+		},
+	}
+
+	// LoadOrStore handles the race where two goroutines concurrently create
+	// a transport for the same cluster -- the loser's transport is discarded
+	// (it has no active connections so there is no resource leak).
+	actual, _ := k.transports.LoadOrStore(clusterName, transport)
+	return actual.(*http.Transport)
+}
+
 func (k *userServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	if klog.V(4).Enabled() {
 		dump, err := httputil.DumpRequest(req, true)
@@ -189,32 +257,48 @@ func (k *userServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	tunnel, err := k.getTunnel(req.Context())
-	if err != nil {
-		http.Error(wr, err.Error(), http.StatusBadRequest)
-		return
+	// Upgrade requests (SPDY/WebSocket, e.g. kubectl exec terminal sessions) are
+	// long-lived and need a dedicated tunnel for their duration. They bypass the
+	// shared transport cache and get the current single-use tunnel behavior.
+	//
+	// REST API requests use the cached transport. Go's http.Transport retains
+	// the net.Conn (the konnectivity tunnel) in its idle pool after each request
+	// completes, so DialContext -- which creates a new gRPC tunnel -- is only
+	// called on a pool miss. Sequential requests to the same cluster reuse the
+	// idle connection and the existing Proxy() stream on the proxy-server,
+	// avoiding the per-request tunnel churn that causes proxy-server saturation.
+	var transport http.RoundTripper
+	if httpstream.IsUpgradeRequest(req) {
+		klog.V(4).Infof("upgrade request for cluster %s, using dedicated tunnel", tsc.Cluster)
+		tunnel, err := k.getTunnel(req.Context())
+		if err != nil {
+			http.Error(wr, err.Error(), http.StatusBadRequest)
+			return
+		}
+		transport = &http.Transport{
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			// Not using our global TLSConfig for outbound will rely on server settings
+			TLSClientConfig: &tls.Config{
+				RootCAs:    serviceProxyRootCA,
+				MinVersion: tls.VersionTLS12,
+			},
+			// golang http pkg automatically upgrade http connection to http2 connection, but http2 can not upgrade to SPDY which used in "kubectl exec".
+			// set ForceAttemptHTTP2 = false to prevent auto http2 upgration
+			ForceAttemptHTTP2: false,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				klog.V(4).Infof("proxy dial to %s (upgrade request)", addr)
+				return tunnel.DialContext(ctx, network, addr)
+			},
+		}
+	} else {
+		transport = k.getOrCreateTransport(tsc.Cluster)
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
-	proxy.Transport = &http.Transport{
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		// Not using our global TLSConfig for outbound will rely on server settings
-		TLSClientConfig: &tls.Config{
-			RootCAs:    serviceProxyRootCA,
-			MinVersion: tls.VersionTLS12,
-		},
-		// golang http pkg automatically upgrade http connection to http2 connection, but http2 can not upgrade to SPDY which used in "kubectl exec".
-		// set ForceAttemptHTTP2 = false to prevent auto http2 upgration
-		ForceAttemptHTTP2: false,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			klog.V(4).Infof("proxy dial to %s", addr)
-			// TODO: may find a way to cache the proxyConn.
-			return tunnel.DialContext(ctx, network, addr)
-		},
-	}
+	proxy.Transport = transport
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, r *http.Request, e error) {
 		http.Error(rw, fmt.Sprintf("proxy to anp-proxy-server failed because %v", e), http.StatusBadGateway)
