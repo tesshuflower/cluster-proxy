@@ -14,7 +14,8 @@ import (
 
 	"github.com/spf13/cobra"
 	authenticationv1 "k8s.io/api/authentication/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -23,6 +24,24 @@ import (
 	"open-cluster-management.io/cluster-proxy/pkg/constant"
 	"open-cluster-management.io/cluster-proxy/pkg/utils"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+)
+
+const (
+	// defaultTokenReviewCacheTTL is the default TTL for cached TokenReview
+	// results. Cached entries expire after this duration, forcing a fresh
+	// TokenReview API call. A short TTL (10s) is sufficient because the
+	// primary goal is deduplicating concurrent requests for the same token.
+	defaultTokenReviewCacheTTL = 10 * time.Second
+
+	// defaultKubeClientQPS is the default QPS for kube clients used by
+	// service-proxy. The default client-go value (5) is too low for
+	// high-concurrency TokenReview workloads, causing client-side throttling
+	// delays when many requests are proxied simultaneously.
+	defaultKubeClientQPS = 50.0
+
+	// defaultKubeClientBurst is the default burst for kube clients used by
+	// service-proxy.
+	defaultKubeClientBurst = 100
 )
 
 func NewServiceProxyCommand() *cobra.Command {
@@ -55,11 +74,22 @@ type serviceProxy struct {
 	hubKubeClient            kubernetes.Interface
 	managedClusterKubeClient kubernetes.Interface
 
+	tokenReviewCacheTTL time.Duration
+	kubeClientQPS       float32
+	kubeClientBurst     int
+
+	managedClusterAuthenticator authenticator.Token
+	hubAuthenticator            authenticator.Token
+
 	enableImpersonation bool
 }
 
 func newServiceProxy() *serviceProxy {
-	return &serviceProxy{}
+	return &serviceProxy{
+		tokenReviewCacheTTL: defaultTokenReviewCacheTTL,
+		kubeClientQPS:       defaultKubeClientQPS,
+		kubeClientBurst:     defaultKubeClientBurst,
+	}
 }
 
 func (s *serviceProxy) AddFlags(cmd *cobra.Command) {
@@ -78,6 +108,13 @@ func (s *serviceProxy) AddFlags(cmd *cobra.Command) {
 	flags.DurationVar(&s.tLSHandshakeTimeout, "tls-handshake-timeout", 10*time.Second, "The maximum amount of time waiting to wait for a TLS handshake.")
 	flags.DurationVar(&s.expectContinueTimeout, "expect-continue-timeout", 1*time.Second, "The amount of time to wait for a server's first response headers after fully writing the request headers if the request has an \"Expect: 100-continue\" header.")
 	flags.BoolVar(&s.enableImpersonation, "enable-impersonation", true, "Whether to enable impersonation")
+
+	// token review cache flags
+	flags.DurationVar(&s.tokenReviewCacheTTL, "token-review-cache-ttl", s.tokenReviewCacheTTL, "TTL for cached TokenReview results. Set to 0 to disable caching.")
+
+	// kube client rate limiting flags
+	flags.Float32Var(&s.kubeClientQPS, "kube-api-qps", s.kubeClientQPS, "QPS for Kubernetes API clients. Increase if client-side throttling is observed under high concurrency.")
+	flags.IntVar(&s.kubeClientBurst, "kube-api-burst", s.kubeClientBurst, "Burst for Kubernetes API clients.")
 }
 
 func (s *serviceProxy) Run(ctx context.Context) error {
@@ -134,6 +171,8 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to get in-cluster config: %v", err)
 	}
+	config.QPS = s.kubeClientQPS
+	config.Burst = s.kubeClientBurst
 
 	s.managedClusterKubeClient, err = kubernetes.NewForConfig(config)
 	if err != nil {
@@ -145,10 +184,18 @@ func (s *serviceProxy) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	hubConfig.QPS = s.kubeClientQPS
+	hubConfig.Burst = s.kubeClientBurst
 	s.hubKubeClient, err = kubernetes.NewForConfig(hubConfig)
 	if err != nil {
 		return err
 	}
+
+	s.managedClusterAuthenticator = newTokenReviewAuthenticator(s.managedClusterKubeClient, s.tokenReviewCacheTTL)
+	s.hubAuthenticator = newTokenReviewAuthenticator(s.hubKubeClient, s.tokenReviewCacheTTL)
+
+	klog.Infof("service-proxy token review cache: ttl=%v kubeClientQPS=%.0f kubeClientBurst=%d",
+		s.tokenReviewCacheTTL, s.kubeClientQPS, s.kubeClientBurst)
 
 	go func() {
 		if err = utils.ServeHealthProbes(":8000", customChecks...); err != nil {
@@ -226,38 +273,6 @@ func (s *serviceProxy) validate() error {
 	return nil
 }
 
-func (s *serviceProxy) hubUserAuthenticatedAndInfo(token string) (bool, *authenticationv1.UserInfo, error) {
-	tokenReview, err := s.hubKubeClient.AuthenticationV1().TokenReviews().Create(context.Background(), &authenticationv1.TokenReview{
-		Spec: authenticationv1.TokenReviewSpec{
-			Token: token,
-		},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		return false, nil, err
-	}
-
-	if !tokenReview.Status.Authenticated {
-		return false, nil, nil
-	}
-	return true, &tokenReview.Status.User, nil
-}
-
-func (s *serviceProxy) managedClusterUserAuthenticatedAndInfo(token string) (bool, *authenticationv1.UserInfo, error) {
-	tokenReview, err := s.managedClusterKubeClient.AuthenticationV1().TokenReviews().Create(context.Background(), &authenticationv1.TokenReview{
-		Spec: authenticationv1.TokenReviewSpec{
-			Token: token,
-		},
-	}, metav1.CreateOptions{})
-	if err != nil {
-		return false, nil, err
-	}
-
-	if !tokenReview.Status.Authenticated {
-		return false, nil, nil
-	}
-	return true, &tokenReview.Status.User, nil
-}
-
 func (s *serviceProxy) getImpersonateToken() (string, error) {
 	// Read the latest token from the mounted file
 	token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
@@ -286,7 +301,7 @@ func (s *serviceProxy) processAuthentication(req *http.Request) error {
 	stripClientImpersonationHeaders(req.Header)
 
 	// determine if the token is a managed cluster user
-	managedClusterAuthenticated, _, err := s.managedClusterUserAuthenticatedAndInfo(token)
+	managedClusterResponse, managedClusterAuthenticated, err := s.managedClusterAuthenticator.AuthenticateToken(context.Background(), token)
 	if err != nil {
 		klog.ErrorS(err, "managed cluster authentication failed")
 		return fmt.Errorf("managed cluster authentication failed: %v", err)
@@ -294,37 +309,38 @@ func (s *serviceProxy) processAuthentication(req *http.Request) error {
 
 	if !managedClusterAuthenticated {
 		// determine if the token is a hub user
-		hubAuthenticated, hubUserInfo, err := s.hubUserAuthenticatedAndInfo(token)
+		hubResponse, hubAuthenticated, err := s.hubAuthenticator.AuthenticateToken(context.Background(), token)
 		if err != nil {
 			klog.ErrorS(err, "hub cluster authentication failed")
 			return fmt.Errorf("authentication failed: managed cluster auth: not authenticated, hub cluster auth error: %v", err)
 		}
 		if !hubAuthenticated {
-			klog.ErrorS(err, "authentication failed: token is neither valid for managed cluster nor hub cluster")
 			return fmt.Errorf("authentication failed: token is neither valid for managed cluster nor hub cluster")
 		}
 
-		if err := s.processHubUser(req, hubUserInfo); err != nil {
+		if err := s.processHubUser(req, hubResponse.User); err != nil {
 			klog.ErrorS(err, "failed to process hub user")
 			return fmt.Errorf("failed to process hub user: %v", err)
 		}
+	} else {
+		klog.V(6).Infof("managed cluster authentication succeeded for user %q", managedClusterResponse.User.GetName())
 	}
 
 	return nil
 }
 
 // processHubUser handles the hub user specific operations including impersonation
-func (s *serviceProxy) processHubUser(req *http.Request, hubUserInfo *authenticationv1.UserInfo) error {
+func (s *serviceProxy) processHubUser(req *http.Request, hubUserInfo user.Info) error {
 	req.Header.Del(authenticationv1.ImpersonateGroupHeader)
-	for _, group := range hubUserInfo.Groups {
+	for _, group := range hubUserInfo.GetGroups() {
 		req.Header.Add(authenticationv1.ImpersonateGroupHeader, group)
 	}
 
 	// check if the hub user is serviceaccount kind, if so, add "cluster:hub:" prefix to the username
-	if strings.HasPrefix(hubUserInfo.Username, "system:serviceaccount:") {
-		req.Header.Set(authenticationv1.ImpersonateUserHeader, fmt.Sprintf("cluster:hub:%s", hubUserInfo.Username))
+	if strings.HasPrefix(hubUserInfo.GetName(), "system:serviceaccount:") {
+		req.Header.Set(authenticationv1.ImpersonateUserHeader, fmt.Sprintf("cluster:hub:%s", hubUserInfo.GetName()))
 	} else {
-		req.Header.Set(authenticationv1.ImpersonateUserHeader, hubUserInfo.Username)
+		req.Header.Set(authenticationv1.ImpersonateUserHeader, hubUserInfo.GetName())
 	}
 
 	// replace the original token with cluster-proxy service-account token which has impersonate permission
