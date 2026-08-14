@@ -221,7 +221,7 @@ func (k *userServer) init(ctx context.Context) error {
 	k.addonLister = addonInformerFactory.Addon().V1alpha1().ManagedClusterAddOns().Lister()
 	addonInformerFactory.Start(ctx.Done())
 
-	klog.Infof("transport pool config: maxConnsPerHost=%d maxIdleConnsPerHost=%d idleConnTimeout=%v",
+	klog.Infof("transport pool config: maxConnsPerHost=%d maxIdleConnsPerHost=%d idleConnTimeout=%v http2=enabled (not applicable to upgrade/SPDY requests)",
 		k.maxConnsPerHost, k.maxIdleConnsPerHost, k.idleConnTimeout)
 
 	return nil
@@ -267,9 +267,21 @@ func (k *userServer) getOrCreateTransport(clusterName string) *http.Transport {
 			RootCAs:    serviceProxyRootCA,
 			MinVersion: tls.VersionTLS12,
 		},
-		// golang http pkg automatically upgrade http connection to http2 connection, but http2 can not upgrade to SPDY which used in "kubectl exec".
-		// set ForceAttemptHTTP2 = false to prevent auto http2 upgration
-		ForceAttemptHTTP2:     false,
+		// Enable HTTP/2 on the cached transport. HTTP/2 multiplexes concurrent
+		// requests over a single connection via streams, so all concurrent REST
+		// API calls to the same cluster share one tunnel (one Proxy() handler on
+		// the proxy-server) instead of each needing their own. The service-proxy
+		// accepts HTTP/2 by default -- Go's http.Server enables it automatically
+		// when serving TLS with ListenAndServeTLS.
+		//
+		// SPDY upgrade requests (kubectl exec, VM console sessions) bypass this
+		// cached transport and use a dedicated HTTP/1.1 transport, so SPDY
+		// compatibility is not affected by enabling HTTP/2 here.
+		//
+		// If HTTP/2 negotiation fails (e.g. TLS profile incompatibility), the
+		// transport falls back to HTTP/1.1 automatically, in which case
+		// MaxConnsPerHost limits concurrent tunnels as a safety net.
+		ForceAttemptHTTP2:     true,
 		ExpectContinueTimeout: 1 * time.Second,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			klog.V(4).Infof("creating tunnel for cluster %s (transport pool miss)", clusterName)

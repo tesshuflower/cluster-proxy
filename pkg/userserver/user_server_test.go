@@ -265,8 +265,8 @@ func TestGetOrCreateTransport_Settings(t *testing.T) {
 		t.Errorf("IdleConnTimeout: got %v, want %v",
 			transport.IdleConnTimeout, s.idleConnTimeout)
 	}
-	if transport.ForceAttemptHTTP2 {
-		t.Error("ForceAttemptHTTP2 must be false to allow SPDY upgrades")
+	if !transport.ForceAttemptHTTP2 {
+		t.Error("ForceAttemptHTTP2 must be true on cached transport to enable HTTP/2 multiplexing")
 	}
 	if transport.TLSClientConfig == nil {
 		t.Fatal("TLSClientConfig must not be nil")
