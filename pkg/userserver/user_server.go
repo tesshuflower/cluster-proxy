@@ -372,6 +372,7 @@ func (k *userServer) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 
 	proxy := httputil.NewSingleHostReverseProxy(targetURL)
 	proxy.Transport = transport
+	proxy.FlushInterval = -1
 
 	proxy.ErrorHandler = func(rw http.ResponseWriter, r *http.Request, e error) {
 		http.Error(rw, fmt.Sprintf("proxy to anp-proxy-server failed because %v", e), http.StatusBadGateway)
